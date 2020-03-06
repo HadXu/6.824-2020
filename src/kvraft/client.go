@@ -1,13 +1,20 @@
 package kvraft
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
-
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"sync"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	id        int64
+	requestID int64
+
+	mu     sync.Mutex
+	leader int
 }
 
 func nrand() int64 {
@@ -21,6 +28,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.id = nrand()
+	ck.requestID = 1
 	return ck
 }
 
@@ -39,7 +48,36 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+
+	args := &GetArgs{
+		Key:     key,
+		ClerkID: ck.id,
+	}
+
+	ck.mu.Lock()
+	i := ck.leader
+	ck.mu.Unlock()
+	for {
+		DPrintf("Clerk %d Get to server %d", ck.id, i)
+		reply := &GetReply{}
+		ok := ck.servers[i].Call("KVServer.Get", args, reply)
+		if !ok || reply.Err != "" {
+			if !ok {
+				DPrintf("Clerk %d PutAppend timeout", ck.id)
+			} else {
+				DPrintf("Clerk %d PutAppend failed: %v", ck.id, reply.Err)
+			}
+			i = (i + 1) % len(ck.servers)
+			continue
+		}
+
+		// Remember leader.
+		ck.mu.Lock()
+		ck.leader = i
+		ck.mu.Unlock()
+		return reply.Value
+	}
+
 }
 
 //
@@ -54,6 +92,38 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := &PutAppendArgs{
+		Op:        op,
+		Key:       key,
+		Value:     value,
+		ClerkID:   ck.id,
+		RequestID: ck.requestID,
+	}
+	ck.requestID = ck.requestID + 1
+
+	ck.mu.Lock()
+	i := ck.leader
+	ck.mu.Unlock()
+	for {
+		DPrintf("Clerk %d PutAppend to server %d, requestID is %v", ck.id, i, ck.requestID-1)
+		reply := &PutAppendReply{}
+		ok := ck.servers[i].Call("KVServer.PutAppend", args, reply)
+		if !ok || reply.Err != "" {
+			if !ok {
+				DPrintf("Clerk %d PutAppend timeout", ck.id)
+			} else {
+				DPrintf("Clerk %d PutAppend failed: %v", ck.id, reply.Err)
+			}
+			i = (i + 1) % len(ck.servers)
+			continue
+		}
+
+		// Remember leader.
+		ck.mu.Lock()
+		ck.leader = i
+		ck.mu.Unlock()
+		return
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

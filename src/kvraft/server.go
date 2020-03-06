@@ -5,8 +5,10 @@ import (
 	"labrpc"
 	"log"
 	"raft"
+	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 0
@@ -18,11 +20,25 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op        string
+	Key       string
+	Value     string
+	ClerkID   int64
+	RequestID int64
+}
+
+type Result struct {
+	Err   Err
+	Value string
+}
+
+type Handler struct {
+	command Op
+	ch      chan *Result
 }
 
 type KVServer struct {
@@ -35,15 +51,104 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
 
+	storage map[string]string // key/value database.
+	notify  map[int]*Handler
+
+	// ClerkID to RequestID
+	records map[int64]int64
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	command := Op{
+		Op:  "Get",
+		Key: args.Key,
+	}
+
+	index, term, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	handler := &Handler{
+		command: command,
+		ch:      make(chan *Result),
+	}
+	kv.notify[index] = handler
+	kv.mu.Unlock()
+
+	for {
+		select {
+		case result := <-handler.ch:
+			reply.Err = result.Err
+			reply.Value = result.Value
+			return
+		case <-time.After(100 * time.Millisecond):
+			current, isLeader := kv.rf.GetState()
+			if !isLeader || term != current {
+				reply.Err = ErrWrongLeader
+				go func() {
+					<-handler.ch
+				}()
+				return
+			}
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	if kv.records[args.ClerkID] > args.RequestID {
+		// The request has been committed.
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	command := Op{
+		Op:    args.Op,
+		Key:   args.Key,
+		Value: args.Value,
+
+		ClerkID:   args.ClerkID,
+		RequestID: args.RequestID,
+	}
+
+	index, term, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	handler := &Handler{
+		command: command,
+		ch:      make(chan *Result),
+	}
+	kv.notify[index] = handler
+	kv.mu.Unlock()
+
+	for {
+		select {
+		case result := <-handler.ch:
+			reply.Err = result.Err
+			return
+		case <-time.After(100 * time.Millisecond):
+			current, isLeader := kv.rf.GetState()
+			if !isLeader || term != current {
+				// This request may never be committed, just return.
+				reply.Err = ErrWrongLeader
+				go func() {
+					<-handler.ch
+				}()
+				return
+			}
+		}
+	}
 }
 
 //
@@ -96,6 +201,79 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.storage = make(map[string]string)
+	kv.notify = make(map[int]*Handler)
+	kv.records = make(map[int64]int64)
+
+	go func() {
+		for {
+			msg := <-kv.applyCh
+			DPrintf("Server %d get a message %v from applyCh", kv.me, msg)
+			op, ok := msg.Command.(Op)
+			if !ok {
+				panic("assert command failed")
+			}
+
+			var value string
+			switch op.Op {
+			case "Get":
+				value = kv.storage[op.Key]
+
+			case "Put":
+				kv.mu.Lock()
+				requestID := kv.records[op.ClerkID]
+				if op.RequestID > requestID {
+					kv.records[op.ClerkID] = op.RequestID
+					kv.storage[op.Key] = op.Value
+				}
+				kv.mu.Unlock()
+
+			case "Append":
+				kv.mu.Lock()
+				requestID := kv.records[op.ClerkID]
+				if op.RequestID > requestID {
+					kv.records[op.ClerkID] = op.RequestID
+					kv.storage[op.Key] = kv.storage[op.Key] + op.Value
+				}
+				kv.mu.Unlock()
+
+			default:
+				panic("invalid command op")
+
+			}
+
+			kv.mu.Lock()
+			handler, ok := kv.notify[msg.CommandIndex]
+			kv.mu.Unlock()
+			if !ok {
+				continue
+			}
+
+			var result *Result
+			if !reflect.DeepEqual(handler.command, op) {
+				if handler.command.Op != "Get" {
+					// It's still possible that the request has beem committed.
+					kv.mu.Lock()
+					requestID := kv.records[handler.command.ClerkID]
+					kv.mu.Unlock()
+					if handler.command.RequestID <= requestID {
+						handler.ch <- &Result{}
+						continue
+					}
+				}
+				DPrintf("command %v not committed", op)
+				result = &Result{
+					Err: "command not committed",
+				}
+			} else {
+				result = &Result{
+					Value: value,
+				}
+			}
+
+			handler.ch <- result
+		}
+	}()
 
 	return kv
 }
